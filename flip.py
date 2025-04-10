@@ -3,6 +3,7 @@ from diffusers import StableDiffusionPipeline
 from diffusers.schedulers import DDIMScheduler
 from PIL import Image
 import numpy as np
+from tqdm import tqdm
 
 class FlipIllusion:
     def __init__(self, model_id="runwayml/stable-diffusion-v1-5", device="cuda", flip_weight=0.5):
@@ -11,7 +12,7 @@ class FlipIllusion:
         self.pipe = StableDiffusionPipeline.from_pretrained(
             model_id,
             scheduler=DDIMScheduler.from_pretrained(model_id, subfolder="scheduler"),
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            torch_dtype=torch.float32,
         )
         self.pipe = self.pipe.to(device)
         self.device = device
@@ -61,7 +62,7 @@ class FlipIllusion:
     
     def __call__(
         self,
-        prompt,
+        prompts,
         height=512,
         width=512,
         num_inference_steps=50,
@@ -77,38 +78,43 @@ class FlipIllusion:
         # Set random seed if provided
         if seed is not None:
             torch.manual_seed(seed)
-            
-        # Prepare text embeddings
-        text_inputs = self.pipe.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=self.pipe.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        text_input_ids = text_inputs.input_ids.to(self.device)
         
-        # Get text embeddings
-        text_embeddings = self.pipe.text_encoder(text_input_ids)[0]
+        prompt_embeddings = []
+        uncond_embeddings = []
+        negative_prompts = [negative_prompt] * len(prompts)
         
-        # Get unconditional embeddings for classifier-free guidance
-        if guidance_scale > 1.0:
-            max_length = text_input_ids.shape[-1]
-            uncond_input = self.pipe.tokenizer(
-                [""] if negative_prompt is None else [negative_prompt],
+        for i, prompt in enumerate(prompts):
+            # Tokenize the prompt
+            text_inputs = self.pipe.tokenizer(
+                prompt,
                 padding="max_length",
-                max_length=max_length,
+                max_length=self.pipe.tokenizer.model_max_length,
                 truncation=True,
                 return_tensors="pt",
             )
-            uncond_embeddings = self.pipe.text_encoder(
-                uncond_input.input_ids.to(self.device)
-            )[0]
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            text_input_ids = text_inputs.input_ids.to(self.device)
+            
+            embedding = self.pipe.text_encoder(text_input_ids)[0]
+            prompt_embeddings.append(embedding)
+            
+            # Handle unconditional embeddings for CFG
+            if guidance_scale > 1.0:
+                uncond_inputs = self.pipe.tokenizer(
+                    negative_prompts[i],
+                    padding="max_length",
+                    max_length=self.pipe.tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                uncond_input_ids = uncond_inputs.input_ids.to(self.device)
+                
+                # Get unconditional embeddings
+                uncond_embedding = self.pipe.text_encoder(uncond_input_ids)[0]
+                uncond_embeddings.append(uncond_embedding)
         
         # Prepare initial latents
         latents_shape = (1, self.pipe.unet.in_channels, height // 8, width // 8)
-        latents = torch.randn(latents_shape, device=self.device, dtype=text_embeddings.dtype)
+        latents = torch.randn(latents_shape, device=self.device, dtype=prompt_embeddings[0].dtype)
         latents = latents * self.pipe.scheduler.init_noise_sigma
         
         # Set timesteps
@@ -119,7 +125,7 @@ class FlipIllusion:
         extra_step_kwargs = self.pipe.scheduler.config.get("extra_step_kwargs", {})
         
         # Denoising loop with dual noise prediction
-        for i, t in enumerate(timesteps):
+        for _, t in tqdm(enumerate(timesteps)):
             # Create flipped version of current latents
             flipped_latents = self.get_flipped_latents(latents)
             
@@ -130,13 +136,13 @@ class FlipIllusion:
             # Get noise predictions for original latents
             with torch.no_grad():
                 noise_pred_original = self.pipe.unet(
-                    latent_model_input, t, encoder_hidden_states=text_embeddings
+                    latent_model_input, t, encoder_hidden_states=torch.cat([prompt_embeddings[0], uncond_embeddings[0]])
                 ).sample
             
             # Get noise predictions for flipped latents
             with torch.no_grad():
                 noise_pred_flipped = self.pipe.unet(
-                    flipped_model_input, t, encoder_hidden_states=text_embeddings
+                    flipped_model_input, t, encoder_hidden_states=torch.cat([prompt_embeddings[1], uncond_embeddings[1]])
                 ).sample
             
             # Perform guidance separately for each noise prediction
